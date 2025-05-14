@@ -1,0 +1,186 @@
+# File: k8s-troubleshoot.sh
+#!/bin/bash
+
+NAMESPACE=${1:-default}
+
+echo "📌 Namespace: $NAMESPACE"
+echo "📋 Listing all pods and their statuses..."
+kubectl get pods -n $NAMESPACE -o wide
+
+echo ""
+echo "🔍 Checking problematic pods..."
+PODS=$(kubectl get pods -n $NAMESPACE --no-headers | awk '$3 ~ /CrashLoopBackOff|Error|ImagePullBackOff|ErrImagePull|Pending|ContainerCreating|Terminating/ {print $1}')
+
+if [ -z "$PODS" ]; then
+  echo "✅ No known issues found with pods."
+  exit 0
+fi
+
+for POD in $PODS; do
+  echo "============================"
+  echo "🚨 Pod: $POD"
+  STATUS=$(kubectl get pod $POD -n $NAMESPACE -o jsonpath='{.status.phase}')
+  echo "🟡 Status: $STATUS"
+
+  echo "📄 Describe:"
+  kubectl describe pod $POD -n $NAMESPACE | grep -A 10 "Events:"
+
+  echo ""
+  echo "📦 Logs:"
+  CONTAINERS=$(kubectl get pod $POD -n $NAMESPACE -o jsonpath='{.spec.containers[*].name}')
+  for CONTAINER in $CONTAINERS; do
+    echo "📝 Logs for container: $CONTAINER"
+    kubectl logs $POD -c $CONTAINER -n $NAMESPACE --tail=20
+    echo ""
+  done
+done
+
+# File: Dockerfile.k8s-troubleshoot
+FROM bitnami/kubectl:latest
+COPY k8s-troubleshoot.sh /usr/local/bin/k8s-troubleshoot.sh
+RUN chmod +x /usr/local/bin/k8s-troubleshoot.sh
+ENTRYPOINT ["/usr/local/bin/k8s-troubleshoot.sh"]
+
+# File: app.py
+from flask import Flask, jsonify, request, send_file
+from kubernetes import client, config
+import csv, io, os
+
+app = Flask(__name__)
+config.load_kube_config()  # Use load_incluster_config() in cluster
+
+@app.route("/troubleshoot/<namespace>")
+def troubleshoot(namespace):
+    v1 = client.CoreV1Api()
+    issues = []
+
+    pods = v1.list_namespaced_pod(namespace)
+    for pod in pods.items:
+        status = pod.status.phase
+        conditions = pod.status.container_statuses or []
+        for c in conditions:
+            if c.state.waiting:
+                issues.append({
+                    "pod": pod.metadata.name,
+                    "status": status,
+                    "reason": c.state.waiting.reason,
+                    "message": c.state.waiting.message
+                })
+    return jsonify(issues)
+
+@app.route("/export/csv/<namespace>")
+def export_csv(namespace):
+    v1 = client.CoreV1Api()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Pod", "Status", "Reason", "Message"])
+
+    pods = v1.list_namespaced_pod(namespace)
+    for pod in pods.items:
+        status = pod.status.phase
+        conditions = pod.status.container_statuses or []
+        for c in conditions:
+            if c.state.waiting:
+                writer.writerow([
+                    pod.metadata.name,
+                    status,
+                    c.state.waiting.reason,
+                    c.state.waiting.message
+                ])
+    output.seek(0)
+    return send_file(io.BytesIO(output.read().encode()),
+                     mimetype='text/csv',
+                     as_attachment=True,
+                     download_name=f'{namespace}_troubleshoot.csv')
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+
+# File: Dockerfile.web
+FROM python:3.10
+RUN pip install flask kubernetes
+COPY app.py /app.py
+CMD ["python", "/app.py"]
+
+# File: requirements.txt
+flask
+kubernetes
+
+# File: helm-chart/Chart.yaml
+apiVersion: v2
+name: k8s-troubleshooter
+version: 0.1.0
+description: A Helm chart for deploying K8s troubleshooting web app
+
+# File: helm-chart/values.yaml
+replicaCount: 1
+image:
+  repository: yourdockerhub/k8s-web-troubleshooter
+  tag: latest
+  pullPolicy: IfNotPresent
+service:
+  type: ClusterIP
+  port: 80
+
+# File: helm-chart/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-troubleshooter
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: k8s-troubleshooter
+  template:
+    metadata:
+      labels:
+        app: k8s-troubleshooter
+    spec:
+      containers:
+        - name: k8s-troubleshooter
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+          ports:
+            - containerPort: 8080
+
+# File: helm-chart/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-troubleshooter
+spec:
+  selector:
+    app: k8s-troubleshooter
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+  type: {{ .Values.service.type }}
+
+# File: .github/workflows/docker-ci.yml
+name: Build and Push Docker Images
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v2
+      - name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Build and Push CLI Tool
+        run: |
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/k8s-troubleshooter:cli -f Dockerfile.k8s-troubleshoot .
+          docker push ${{ secrets.DOCKER_USERNAME }}/k8s-troubleshooter:cli
+      - name: Build and Push Web Tool
+        run: |
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/k8s-web-troubleshooter:latest -f Dockerfile.web .
+          docker push ${{ secrets.DOCKER_USERNAME }}/k8s-web-troubleshooter:latest
